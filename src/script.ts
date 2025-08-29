@@ -2,6 +2,51 @@ import { Client as PgClient } from "pg";
 import "dotenv/config";
 import { Client as EsClient } from "@elastic/elasticsearch";
 
+type EsDocHit = {
+    docId: string;
+    source: Record<string, any>;
+};
+
+export async function fetchEsDocByEvaluationId(
+    es: EsClient,
+    indexName: string,
+    evaluationId: string
+): Promise<EsDocHit | null> {
+    try {
+        const got = await es.get({ index: indexName, id: evaluationId });
+        const src = (got as any)?._source ?? {};
+        return { docId: evaluationId, source: src };
+    } catch (e: any) {
+        if (e?.meta?.statusCode && e.meta.statusCode !== 404) {
+            throw e;
+        }
+    }
+
+    const searchResp = await es.search({
+        index: indexName,
+        size: 1,
+        track_total_hits: false,
+        _source: ["*"],
+        query: {
+            bool: {
+                should: [
+                    { term: { id: evaluationId } },
+                    { term: { "id.keyword": evaluationId } },
+                ],
+                minimum_should_match: 1,
+            },
+        },
+    });
+
+    const hit = (searchResp as any)?.hits?.hits?.[0];
+    if (!hit) return null;
+
+    return {
+        docId: String(hit._id),
+        source: (hit._source ?? {}) as Record<string, any>,
+    };
+}
+
 const pg = new PgClient({
     host: process.env.DB_HOST,
     port: Number(process.env.DB_PORT || 5432),
@@ -108,6 +153,11 @@ async function backfillScoreDetailsLocal() {
             try {
                 console.log(scoreDetails)
                 const indexName = `contact_evaluation__${externalClientId}`;
+                const found = await fetchEsDocByEvaluationId(es, indexName, evaluationId);
+                if (!found) {
+                    console.warn(`Doc not found in ${indexName} for evaluation ${evaluationId}`);
+                    continue;
+                }
                 console.log(indexName)
 
                 await es.update({
