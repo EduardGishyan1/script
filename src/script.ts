@@ -178,7 +178,7 @@ async function backfillScoreDetailsLocal() {
             const externalClientId = (ev?.client_external_id || ev?.contact_client_external_id || "").toLowerCase();
             if (!externalClientId) { skipped++; continue; }
 
-            const indexName = `contact_evaluation__${externalClientId}`;
+            const indexName = `contact_evaluation___${externalClientId}`;
 
             queueUpdate(indexName, evaluationId, { scoreDetails });
 
