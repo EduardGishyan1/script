@@ -5,26 +5,27 @@ import * as fs from "fs";
 import * as path from "path";
 
 const pg = new PgClient({
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT || 5432),
-    user: process.env.DB_USERNAME,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
+    host: "host",
+    port: 5432,
+    user: "postgres",
+    password: "password",
+    database: "db",
 });
 
 const es = new EsClient({
-    node: process.env.ELASTIC_URL!,
-    compression: true,
+    node: "node",
     requestTimeout: 60 * 60 * 1000,
     pingTimeout: 60 * 60 * 1000,
     auth: {
-        username: process.env.ELASTIC_USER!,
-        password: process.env.ELASTIC_PASS!,
+        username: "username",
+        password: "password",
     },
     tls: {
         rejectUnauthorized: false,
     },
 });
+
+
 type ScoreDetailOut = {
     categoryId: string;
     categorySlug?: string;
@@ -34,8 +35,12 @@ type ScoreDetailOut = {
     phrases?: string[];
 };
 
-const PROGRESS_FILE = process.env.PROGRESS_FILE || path.resolve(process.cwd(), "scoredetails_progress.json");
-const FAILED_FILE   = process.env.FAILED_FILE   || path.resolve(process.cwd(), "scoredetails_failed.jsonl");
+const PROGRESS_FILE =
+    process.env.PROGRESS_FILE ||
+    path.resolve(process.cwd(), "scoredetails_progress.json");
+const FAILED_FILE =
+    process.env.FAILED_FILE ||
+    path.resolve(process.cwd(), "scoredetails_failed.jsonl");
 
 function loadProgress(): Set<string> {
     try {
@@ -46,7 +51,10 @@ function loadProgress(): Set<string> {
         if (!Array.isArray(arr)) return new Set();
         return new Set(arr.map(String));
     } catch (e) {
-        console.warn(`Could not read progress file; starting fresh (${PROGRESS_FILE})`, e);
+        console.warn(
+            `Could not read progress file; starting fresh (${PROGRESS_FILE})`,
+            e,
+        );
         return new Set();
     }
 }
@@ -60,41 +68,72 @@ function saveProgress(processed: Set<string>) {
 function appendFailed(ids: string[], reason?: string) {
     if (!ids.length) return;
     const ts = new Date().toISOString();
-    const lines = ids.map(id => JSON.stringify({ id, reason, ts })).join("\n") + "\n";
+    const lines =
+        ids.map((id) => JSON.stringify({ id, reason, ts })).join("\n") + "\n";
     fs.appendFileSync(FAILED_FILE, lines, "utf8");
 }
 
-const BULK_FLUSH_SIZE = 1500;
+const BULK_FLUSH_SIZE = 3;
 let bulkBody: any[] = [];
 let bulkCount = 0;
 let pendingIds: string[] = [];
 
 async function flushBulk(reason = "flush") {
-    if (bulkBody.length === 0) return { ok: 0, fail: 0, succeededIds: [] as string[], failedIds: [] as string[] };
+    if (bulkBody.length === 0) {
+        return { ok: 0, fail: 0, succeededIds: [] as string[], failedIds: [] as string[] };
+    }
 
-    const res = await es.bulk({ body: bulkBody, refresh: false });
-    const items = (res as any)?.items ?? [];
+    let res: any;
+    try {
+        res = await es.bulk({
+            body: bulkBody,
+            refresh: "wait_for",
+        });
+        console.log(res)
+    } catch (err: any) {
+        const failedIds = pendingIds.slice();
+        console.error(`BULK ${reason}: transport error`, err?.meta?.statusCode || err?.statusCode || err);
+        bulkBody = [];
+        bulkCount = 0;
+        pendingIds = [];
+        return { ok: 0, fail: failedIds.length, succeededIds: [], failedIds };
+    }
+
+    const items: any[] = Array.isArray(res?.items) ? res.items : [];
+    const took = res?.took;
+    const hasErrors = !!res?.errors;
+
     let ok = 0;
     const succeededIds: string[] = [];
     const failedIds: string[] = [];
-    let firstErr: any = null;
 
+    if (items.length !== pendingIds.length) {
+        console.warn(
+            `BULK ${reason}: items length ${items.length} != pendingIds length ${pendingIds.length} (check bulk body pairing)`
+        );
+    }
     for (let i = 0; i < items.length; i++) {
-        const updateItem = items[i]?.update;
-        const hadError = !!updateItem?.error;
+        const action = items[i];
+        const key = action && Object.keys(action)[0];
+        const result = key ? action[key] : undefined;
+        const hadError = !!result?.error;
         const evId = pendingIds[i];
+
         if (!hadError) {
             ok++;
             if (evId) succeededIds.push(evId);
         } else {
             if (evId) failedIds.push(evId);
-            if (!firstErr) firstErr = updateItem.error;
+            if (failedIds.length <= 3) {
+                console.warn(
+                    `BULK ${reason}: item error [${key}] id=${evId ?? result?._id} type=${result?.error?.type} reason=${result?.error?.reason}`
+                );
+            }
         }
     }
-    const fail = items.length - ok;
 
-    console.log(`BULK ${reason}: items=${items.length} ok=${ok} fail=${fail} took=${(res as any)?.took}ms`);
-    if (firstErr) console.warn("first bulk error:", firstErr);
+    const fail = items.length - ok;
+    console.log(`BULK ${reason}: items=${items.length} ok=${ok} fail=${fail} errors=${hasErrors} took=${took}ms`);
 
     bulkBody = [];
     bulkCount = 0;
@@ -104,11 +143,15 @@ async function flushBulk(reason = "flush") {
 }
 
 function queueUpdate(indexName: string, id: string, doc: any) {
-    bulkBody.push({ update: { _index: indexName, _id: id, retry_on_conflict: 3 } });
+    bulkBody.push({
+        update: { _index: indexName, _id: id, retry_on_conflict: 3, require_alias: true, },
+    });
     bulkBody.push({ doc });
     bulkCount++;
     pendingIds.push(id);
 }
+const EXCLUDED_CLIENT_ID = "0e57b625-ff35-11ef-8005-0ebcd8044491";
+const MAX_REQUESTS = 3
 
 async function backfillScoreDetailsLocal() {
     await pg.connect();
@@ -116,6 +159,7 @@ async function backfillScoreDetailsLocal() {
     const processed = loadProgress();
     console.log(`Progress file: ${PROGRESS_FILE} (loaded ${processed.size} ids)`);
     console.log(`Failed file (JSONL): ${FAILED_FILE}`);
+    if (MAX_REQUESTS) console.log(`MAX_REQUESTS=${MAX_REQUESTS}`);
 
     try {
         const { rows: rawIds } = await pg.query<{ evaluation_id: string }>(
@@ -128,8 +172,14 @@ async function backfillScoreDetailsLocal() {
         let success = 0;
         let failed = 0;
         let skipped = 0;
+        let processedCount = 0;
 
         for (const evaluationId of evaluationIds) {
+            if (MAX_REQUESTS && processedCount >= MAX_REQUESTS) {
+                console.log(`Reached MAX_REQUESTS=${MAX_REQUESTS}, stopping early.`);
+                break;
+            }
+
             if (processed.has(evaluationId)) {
                 skipped++;
                 continue;
@@ -143,7 +193,10 @@ async function backfillScoreDetailsLocal() {
          WHERE esd.evaluation_id = $1`,
                 [evaluationId]
             );
-            if (!details.length) { skipped++; continue; }
+            if (!details.length) {
+                skipped++;
+                continue;
+            }
 
             const scoreDetails: ScoreDetailOut[] = details
                 .map((d) => ({
@@ -161,7 +214,10 @@ async function backfillScoreDetailsLocal() {
                         d.justification ||
                         (Array.isArray(d.phrases) && d.phrases.length > 0)
                 );
-            if (!scoreDetails.length) { skipped++; continue; }
+            if (!scoreDetails.length) {
+                skipped++;
+                continue;
+            }
 
             const { rows: evRows } = await pg.query<any>(
                 `SELECT e.id,
@@ -176,20 +232,27 @@ async function backfillScoreDetailsLocal() {
             );
             const ev = evRows[0];
             const externalClientId = (ev?.client_external_id || ev?.contact_client_external_id || "").toLowerCase();
-            if (!externalClientId) { skipped++; continue; }
 
-            const indexName = `contact_evaluation___${externalClientId}`;
+            if (!externalClientId || externalClientId === EXCLUDED_CLIENT_ID) {
+                skipped++;
+                continue;
+            }
 
+            const indexName = `contact_evaluation__${externalClientId}`;
             queueUpdate(indexName, evaluationId, { scoreDetails });
+            processedCount++;
 
             if (bulkCount >= BULK_FLUSH_SIZE) {
                 const { ok, fail, succeededIds, failedIds } = await flushBulk("periodic");
                 success += ok;
-                failed  += fail;
+                failed += fail;
 
                 let added = 0;
                 for (const id of succeededIds) {
-                    if (!processed.has(id)) { processed.add(id); added++; }
+                    if (!processed.has(id)) {
+                        processed.add(id);
+                        added++;
+                    }
                 }
                 if (added > 0) saveProgress(processed);
 
@@ -199,18 +262,30 @@ async function backfillScoreDetailsLocal() {
 
         const { ok, fail, succeededIds, failedIds } = await flushBulk("final");
         success += ok;
-        failed  += fail;
+        failed += fail;
 
         let added = 0;
         for (const id of succeededIds) {
-            if (!processed.has(id)) { processed.add(id); added++; }
+            if (!processed.has(id)) {
+                processed.add(id);
+                added++;
+            }
         }
         if (added > 0) saveProgress(processed);
 
         if (failedIds.length) appendFailed(failedIds, "bulk-final");
 
-        const summary = { success, failed, skipped, total: evaluationIds.length, saved: processed.size, failedFile: FAILED_FILE };
-        console.log(`\nDone. Success: ${success}, Failed: ${failed}, Skipped: ${skipped}, Total: ${evaluationIds.length}`);
+        const summary = {
+            success,
+            failed,
+            skipped,
+            total: evaluationIds.length,
+            saved: processed.size,
+            failedFile: FAILED_FILE,
+        };
+        console.log(
+            `\nDone. Success: ${success}, Failed: ${failed}, Skipped: ${skipped}, Total: ${evaluationIds.length}`
+        );
         console.log(`Progress saved: ${processed.size} ids`);
         console.log(`Failures appended to: ${FAILED_FILE}`);
         return summary;
