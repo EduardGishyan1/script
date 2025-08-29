@@ -158,7 +158,7 @@ async function backfillScoreDetailsLocal() {
                     console.warn(`Doc not found in ${indexName} for evaluation ${evaluationId}`);
                     continue;
                 }
-                console.log(indexName)
+                console.log(found)
 
                 await es.update({
                     index: indexName,
