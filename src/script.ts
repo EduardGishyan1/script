@@ -1,4 +1,5 @@
 import { Client as PgClient } from "pg";
+import Cursor from "pg-cursor";
 import "dotenv/config";
 import { Client as EsClient } from "@elastic/elasticsearch";
 import * as fs from "fs";
@@ -25,7 +26,6 @@ const es = new EsClient({
     },
 });
 
-
 type ScoreDetailOut = {
     categoryId: string;
     categorySlug?: string;
@@ -51,10 +51,7 @@ function loadProgress(): Set<string> {
         if (!Array.isArray(arr)) return new Set();
         return new Set(arr.map(String));
     } catch (e) {
-        console.warn(
-            `Could not read progress file; starting fresh (${PROGRESS_FILE})`,
-            e,
-        );
+        console.warn(`Could not read progress file; starting fresh (${PROGRESS_FILE})`, e);
         return new Set();
     }
 }
@@ -73,7 +70,7 @@ function appendFailed(ids: string[], reason?: string) {
     fs.appendFileSync(FAILED_FILE, lines, "utf8");
 }
 
-const BULK_FLUSH_SIZE = 3;
+const BULK_FLUSH_SIZE = 1000;
 let bulkBody: any[] = [];
 let bulkCount = 0;
 let pendingIds: string[] = [];
@@ -85,11 +82,7 @@ async function flushBulk(reason = "flush") {
 
     let res: any;
     try {
-        res = await es.bulk({
-            body: bulkBody,
-            refresh: "wait_for",
-        });
-        console.log(res)
+        res = await es.bulk({ body: bulkBody, refresh: "wait_for" });
     } catch (err: any) {
         const failedIds = pendingIds.slice();
         console.error(`BULK ${reason}: transport error`, err?.meta?.statusCode || err?.statusCode || err);
@@ -100,18 +93,12 @@ async function flushBulk(reason = "flush") {
     }
 
     const items: any[] = Array.isArray(res?.items) ? res.items : [];
-    const took = res?.took;
     const hasErrors = !!res?.errors;
 
     let ok = 0;
     const succeededIds: string[] = [];
     const failedIds: string[] = [];
 
-    if (items.length !== pendingIds.length) {
-        console.warn(
-            `BULK ${reason}: items length ${items.length} != pendingIds length ${pendingIds.length} (check bulk body pairing)`
-        );
-    }
     for (let i = 0; i < items.length; i++) {
         const action = items[i];
         const key = action && Object.keys(action)[0];
@@ -132,26 +119,25 @@ async function flushBulk(reason = "flush") {
         }
     }
 
-    const fail = items.length - ok;
-    console.log(`BULK ${reason}: items=${items.length} ok=${ok} fail=${fail} errors=${hasErrors} took=${took}ms`);
+    console.log(`BULK ${reason}: ok=${ok} fail=${failedIds.length} errors=${hasErrors}`);
 
     bulkBody = [];
     bulkCount = 0;
     pendingIds = [];
 
-    return { ok, fail, succeededIds, failedIds };
+    return { ok, fail: failedIds.length, succeededIds, failedIds };
 }
 
 function queueUpdate(indexName: string, id: string, doc: any) {
     bulkBody.push({
-        update: { _index: indexName, _id: id, retry_on_conflict: 3, require_alias: true, },
+        update: { _index: indexName, _id: id, retry_on_conflict: 3, require_alias: true },
     });
     bulkBody.push({ doc });
     bulkCount++;
     pendingIds.push(id);
 }
+
 const EXCLUDED_CLIENT_ID = "0e57b625-ff35-11ef-8005-0ebcd8044491";
-const MAX_REQUESTS = 3
 
 async function backfillScoreDetailsLocal() {
     await pg.connect();
@@ -159,139 +145,96 @@ async function backfillScoreDetailsLocal() {
     const processed = loadProgress();
     console.log(`Progress file: ${PROGRESS_FILE} (loaded ${processed.size} ids)`);
     console.log(`Failed file (JSONL): ${FAILED_FILE}`);
-    if (MAX_REQUESTS) console.log(`MAX_REQUESTS=${MAX_REQUESTS}`);
 
-    try {
-        const { rows: rawIds } = await pg.query<{ evaluation_id: string }>(
-            `SELECT DISTINCT evaluation_id FROM evaluation_score_details`
-        );
+    let success = 0, failed = 0, skipped = 0;
 
-        const evaluationIds = rawIds.map((r) => r.evaluation_id);
-        console.log(`Found ${evaluationIds.length} evaluation_ids.`);
+    const cursor = pg.query(new Cursor(`
+        SELECT 
+            e.id AS evaluation_id,
+            esd.category_id,
+            esd.score,
+            esd.justification,
+            esd.phrases,
+            c.slug AS category_slug,
+            c.name AS category_name,
+            COALESCE(cl.external_id, cc.external_id) AS external_client_id
+        FROM evaluations e
+        LEFT JOIN evaluation_score_details esd ON e.id = esd.evaluation_id
+        LEFT JOIN score_detail_categories c ON esd.category_id = c.id
+        LEFT JOIN clients cl ON e.client_id = cl.id
+        LEFT JOIN contacts ct ON e.contact_id = ct.id
+        LEFT JOIN clients cc ON ct.client_id = cc.id
+    `));
 
-        let success = 0;
-        let failed = 0;
-        let skipped = 0;
-        let processedCount = 0;
+    const BATCH_SIZE = 5000;
 
-        for (const evaluationId of evaluationIds) {
-            if (MAX_REQUESTS && processedCount >= MAX_REQUESTS) {
-                console.log(`Reached MAX_REQUESTS=${MAX_REQUESTS}, stopping early.`);
-                break;
-            }
+    function readNextBatch(): Promise<any[]> {
+        return new Promise((resolve, reject) => {
+            cursor.read(BATCH_SIZE, (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows);
+            });
+        });
+    }
 
-            if (processed.has(evaluationId)) {
+    let rows: any[];
+    do {
+        rows = await readNextBatch();
+        const grouped: Record<string, { clientId: string; details: ScoreDetailOut[] }> = {};
+
+        for (const row of rows) {
+            const evId = row.evaluation_id;
+            if (processed.has(evId)) {
                 skipped++;
                 continue;
             }
 
-            const { rows: details } = await pg.query<any>(
-                `SELECT esd.category_id, esd.score, esd.justification, esd.phrases,
-                c.slug as category_slug, c.name as category_name
-         FROM evaluation_score_details esd
-         LEFT JOIN score_detail_categories c ON esd.category_id = c.id
-         WHERE esd.evaluation_id = $1`,
-                [evaluationId]
-            );
-            if (!details.length) {
-                skipped++;
-                continue;
-            }
-
-            const scoreDetails: ScoreDetailOut[] = details
-                .map((d) => ({
-                    categoryId: d.category_id,
-                    categorySlug: d.category_slug || undefined,
-                    categoryName: d.category_name || undefined,
-                    score: Math.round(Number(d.score)),
-                    justification: d.justification || undefined,
-                    phrases: Array.isArray(d.phrases) && d.phrases.length ? d.phrases : undefined,
-                }))
-                .filter(
-                    (d) =>
-                        d.categorySlug ||
-                        d.categoryName ||
-                        d.justification ||
-                        (Array.isArray(d.phrases) && d.phrases.length > 0)
-                );
-            if (!scoreDetails.length) {
-                skipped++;
-                continue;
-            }
-
-            const { rows: evRows } = await pg.query<any>(
-                `SELECT e.id,
-                cl.external_id as client_external_id,
-                cc.external_id as contact_client_external_id
-         FROM evaluations e
-         LEFT JOIN clients cl  ON e.client_id  = cl.id
-         LEFT JOIN contacts ct ON e.contact_id = ct.id
-         LEFT JOIN clients cc  ON ct.client_id = cc.id
-         WHERE e.id = $1`,
-                [evaluationId]
-            );
-            const ev = evRows[0];
-            const externalClientId = (ev?.client_external_id || ev?.contact_client_external_id || "").toLowerCase();
-
+            const externalClientId = (row.external_client_id || "").toLowerCase();
             if (!externalClientId || externalClientId === EXCLUDED_CLIENT_ID) {
                 skipped++;
                 continue;
             }
 
-            const indexName = `contact_evaluation__${externalClientId}`;
-            queueUpdate(indexName, evaluationId, { scoreDetails });
-            processedCount++;
+            if (!grouped[evId]) grouped[evId] = { clientId: externalClientId, details: [] };
+
+            grouped[evId].details.push({
+                categoryId: row.category_id,
+                categorySlug: row.category_slug || undefined,
+                categoryName: row.category_name || undefined,
+                score: Math.round(Number(row.score)),
+                justification: row.justification || undefined,
+                phrases: Array.isArray(row.phrases) && row.phrases.length ? row.phrases : undefined,
+            });
+        }
+
+        for (const [evId, { clientId, details }] of Object.entries(grouped)) {
+            if (!details.length) continue;
+            const indexName = `contact_evaluation___${clientId}`;
+            queueUpdate(indexName, evId, { scoreDetails: details });
 
             if (bulkCount >= BULK_FLUSH_SIZE) {
                 const { ok, fail, succeededIds, failedIds } = await flushBulk("periodic");
                 success += ok;
                 failed += fail;
-
-                let added = 0;
-                for (const id of succeededIds) {
-                    if (!processed.has(id)) {
-                        processed.add(id);
-                        added++;
-                    }
-                }
-                if (added > 0) saveProgress(processed);
-
+                for (const id of succeededIds) processed.add(id);
+                if (succeededIds.length) saveProgress(processed);
                 if (failedIds.length) appendFailed(failedIds, "bulk-periodic");
             }
         }
+    } while (rows.length > 0);
 
-        const { ok, fail, succeededIds, failedIds } = await flushBulk("final");
-        success += ok;
-        failed += fail;
+    const { ok, fail, succeededIds, failedIds } = await flushBulk("final");
+    success += ok;
+    failed += fail;
+    for (const id of succeededIds) processed.add(id);
+    if (succeededIds.length) saveProgress(processed);
+    if (failedIds.length) appendFailed(failedIds, "bulk-final");
 
-        let added = 0;
-        for (const id of succeededIds) {
-            if (!processed.has(id)) {
-                processed.add(id);
-                added++;
-            }
-        }
-        if (added > 0) saveProgress(processed);
+    console.log(`\nDone. Success=${success}, Failed=${failed}, Skipped=${skipped}`);
+    console.log(`Progress saved: ${processed.size} ids`);
+    console.log(`Failures appended to: ${FAILED_FILE}`);
 
-        if (failedIds.length) appendFailed(failedIds, "bulk-final");
-
-        const summary = {
-            success,
-            failed,
-            skipped,
-            total: evaluationIds.length,
-            saved: processed.size,
-            failedFile: FAILED_FILE,
-        };
-        console.log(
-            `\nDone. Success: ${success}, Failed: ${failed}, Skipped: ${skipped}, Total: ${evaluationIds.length}`
-        );
-        console.log(`Progress saved: ${processed.size} ids`);
-        console.log(`Failures appended to: ${FAILED_FILE}`);
-        return summary;
-    } finally {
-        await pg.end();
-    }
+    cursor.close(() => pg.end());
 }
 
 if (require.main === module) {
